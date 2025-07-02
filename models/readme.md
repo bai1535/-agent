@@ -1,0 +1,3 @@
+由于GitHub仓库大小限制，不能上传所有文件，下面是我使用的两个模型名称，可以在huggingface上面下载
+text2vec-large-chinese
+Qwen2.5-7B
