@@ -1,9 +1,10 @@
 import os
-import faiss
 import json
 import torch
+import faiss
 import numpy as np
-from typing import List, Optional, Dict
+from tqdm import tqdm
+from typing import List, Dict, Any
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -13,22 +14,20 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import RetrievalQA
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 from langchain_community.llms import HuggingFacePipeline
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from langchain.embeddings.base import Embeddings
 import warnings
-
-# 忽略LangChain弃用警告
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain.*")
-
+from typing import Optional, Dict  # 新增这行
 # --------------------- 配置参数 ---------------------
 # 向量数据库配置
 USE_GPU = True  # 是否使用GPU加速
 NEAREST_NEIGHBORS = 5  # 检索最近邻数量
-SCORE_THRESHOLD = 0.4  # 相似度阈值
-
+SCORE_THRESHOLD = 0.3  # 相似度阈值
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain.*")
 # 本地模型路径配置
 LOCAL_EMBEDDING_MODEL_PATH = "/root/autodl-tmp/medical/models/text2vec-large-chinese"  # 嵌入模型本地路径
 LOCAL_LLM_MODEL_PATH = "/root/autodl-tmp/medical/models/Qwen2.5-7B"  # 大模型本地路径
+EVALUATION_MODEL_PATH = "/root/autodl-tmp/medical/models/text2vec-large-chinese"  # 评估用语义相似度模型
 
 # --------------------- 路径配置 ---------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 获取当前文件路径
@@ -36,13 +35,14 @@ DATA_DIR = os.path.join(BASE_DIR, "data")  # 中医古籍数据目录
 FAISS_INDEX_DIR = os.path.join(BASE_DIR, "faiss_index")  # 索引存储目录
 FAISS_INDEX_NAME = "medical_knowledge"  # 索引名称
 
-# JSON缓存文件路径
+# 数据文件路径
 JSON_CACHE_FILE = os.path.join(DATA_DIR, "all_chunks.cache.json")
+TEST_DATA_PATH = "/root/autodl-tmp/medical/data/test_questions.json"  # 测试数据集路径
+EVAL_RESULTS_PATH = os.path.join(BASE_DIR, "evaluation_results.json")  # 评估结果保存路径
 
 # 确保目录存在
 os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
-
-# --------------------- 自定义FAISS封装 ---------------------
+os.makedirs(os.path.dirname(EVAL_RESULTS_PATH), exist_ok=True)
 
 class CustomFAISS(FAISS):
     """使用余弦相似度的自定义FAISS封装类"""
@@ -149,6 +149,19 @@ class CustomFAISS(FAISS):
             self.docstore.add({idx: doc})
             self.index_to_docstore_id[starting_index + i] = idx
 
+# --------------------- 辅助类 ---------------------
+class SentenceTransformerEmbeddings(Embeddings):
+    """自定义嵌入模型类"""
+    def __init__(self, model_path: str, device: str):
+        self.model = SentenceTransformer(model_path, device=device)
+    
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.model.encode(texts, batch_size=32, convert_to_numpy=True).tolist()
+    
+    def embed_query(self, text: str) -> list[float]:
+        return self.model.encode(text, convert_to_numpy=True).tolist()
+
+
 # --------------------- 数据加载 ---------------------
 def load_segmented_documents() -> List[Document]:
     """从JSON缓存文件加载分割后的文档"""
@@ -184,19 +197,22 @@ def load_segmented_documents() -> List[Document]:
         print(f"加载缓存文件失败: {str(e)}")
         return []
 
-# --------------------- 向量化与FAISS索引构建 ---------------------
-class SentenceTransformerEmbeddings(Embeddings):
-    def __init__(self, model_path: str, device: str):
-        self.model = SentenceTransformer(model_path, device=device)
-    
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self.model.encode(texts, batch_size=32, convert_to_numpy=True).tolist()
-    
-    def embed_query(self, text: str) -> list[float]:
-        return self.model.encode(text, convert_to_numpy=True).tolist()
 
+def load_test_data() -> List[Dict[str, Any]]:
+    """加载测试数据集"""
+    if not os.path.exists(TEST_DATA_PATH):
+        raise FileNotFoundError(f"测试数据集未找到: {TEST_DATA_PATH}")
+    
+    print(f"加载测试数据集: {TEST_DATA_PATH}")
+    with open(TEST_DATA_PATH, "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+    
+    print(f"找到 {len(test_data)} 个测试问题")
+    return test_data
+
+# --------------------- 向量索引构建 ---------------------
 def build_vector_store() -> CustomFAISS:
-    """构建FAISS向量库（使用余弦相似度）"""
+    """构建FAISS向量库"""
     device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
     
     print(f"正在加载本地嵌入模型: {LOCAL_EMBEDDING_MODEL_PATH}")
@@ -234,12 +250,13 @@ def build_vector_store() -> CustomFAISS:
     print(f"创建新FAISS索引，有效文档数量: {len(docs)}")
     
     try:
-        # 使用自定义方法创建索引（内积索引）
+        # 创建基本索引
         vector_store = CustomFAISS.from_documents(
             documents=docs, 
-            embedding=embedding_model
+            embedding=embedding_model,
+            normalize_L2=True  # 关键：对向量进行归一化
         )
-        print("FAISS索引创建成功（使用余弦相似度）")
+        print("FAISS索引创建成功")
     except Exception as e:
         print(f"标准方法创建索引失败: {str(e)}，尝试分批次方法...")
         # 分批次处理文档
@@ -253,7 +270,8 @@ def build_vector_store() -> CustomFAISS:
                 # 第一批文档创建索引
                 vector_store = CustomFAISS.from_documents(
                     documents=batch_docs, 
-                    embedding=embedding_model
+                    embedding=embedding_model,
+                    normalize_L2=True  # 关键：对向量进行归一化
                 )
                 print(f"已创建初始索引，处理文档: {min(i+batch_size, len(docs))}/{len(docs)}")
             else:
@@ -269,14 +287,13 @@ def build_vector_store() -> CustomFAISS:
     print(f"索引已保存至: {FAISS_INDEX_DIR}，索引名称: {FAISS_INDEX_NAME}")
     
     return vector_store
-
 # --------------------- 问答系统初始化 ---------------------
 def initialize_qa_chain() -> RetrievalQA:
     """初始化问答链"""
     # 1. 加载向量数据库
     vector_store = build_vector_store()
     
-    # 2. 加载大模型 - 使用本地模型
+    # 2. 加载大模型
     device = "cuda" if USE_GPU and torch.cuda.is_available() else "cpu"
     print(f"正在加载本地大模型: {LOCAL_LLM_MODEL_PATH}")
     
@@ -298,26 +315,28 @@ def initialize_qa_chain() -> RetrievalQA:
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=500,  # 增加生成长度以容纳完整回答
-        temperature=0.2,    # 降低随机性
+        max_new_tokens=300,
+        temperature=0.1,
         top_p=0.9,
-        repetition_penalty=1.2,
-        pad_token_id=tokenizer.eos_token_id  # 避免警告
+        repetition_penalty=1.1
     )
     
     llm = HuggingFacePipeline(pipeline=pipe)
     
     # 3. 构建基础检索器
     print("构建基础检索器...")
+
+    
+    # 直接使用FAISS检索器，不使用压缩
     retriever = vector_store.as_retriever(
-        search_type="similarity",  # 使用相似度搜索
         search_kwargs={
             "k": NEAREST_NEIGHBORS,
             "score_threshold": SCORE_THRESHOLD
         }
     )
     
-    # 4. 改进的中医问答专用提示模板
+    # 4. 定义中医问答提示模板
+    # 修改提示模板 - 移除冗余信息
     prompt_template = """
     ### 系统角色：
     你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户问题。
@@ -344,9 +363,8 @@ def initialize_qa_chain() -> RetrievalQA:
         template=prompt_template.strip(),
         input_variables=["context", "question"]
     )
-    
-    # 5. 创建问答链
-    return RetrievalQA.from_chain_type(
+
+    qa = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
@@ -356,74 +374,173 @@ def initialize_qa_chain() -> RetrievalQA:
         },
         return_source_documents=True
     )
+    return qa
 
-# --------------------- 终端交互 ---------------------
-def interactive_console(qa_chain: RetrievalQA):
-    """命令行交互界面"""
-    print("\n===== 中医古籍智能问答系统 =====")
-    print("输入格式：直接提问（支持中医病症、方剂、药材等问题）")
-    print("输入'quit'退出，输入'source'查看参考原文\n")
+# --------------------- 评估函数 ---------------------
+def calculate_semantic_similarity(model, answer: str, reference: str) -> float:
+    """计算生成答案与参考答案的语义相似度"""
+    embeddings = model.encode([answer, reference], convert_to_tensor=True)
+    similarity = util.pytorch_cos_sim(embeddings[0], embeddings[1]).item()
+    return float(similarity)  # 确保返回Python float类型
+
+def evaluate_qa_system(qa_chain: RetrievalQA, test_data: List[Dict]) -> Dict:
+    """评估问答系统性能"""
+    print("正在初始化评估模型...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    eval_model = SentenceTransformer(EVALUATION_MODEL_PATH, device=device)
     
-    while True:
-        query = input("用户提问 >> ").strip()
-        if query.lower() == "quit":
-            break
+    results = []
+    metrics = {
+        "total_questions": len(test_data),
+        "answered_questions": 0,
+        "avg_similarity": 0.0,
+        "avg_retrieval_score": 0.0,
+        "avg_retrieved_docs": 0.0,
+        "failed_questions": 0
+    }
+    
+    print("\n开始评估问答系统...")
+    for item in tqdm(test_data, desc="评估进度"):
+        question = item["question"]
+        reference = item["reference_answer"]
         
         try:
-            print("\n正在检索古籍数据库...")
-            result = qa_chain.invoke({"query": query})
+            # 获取系统回答
+            result = qa_chain({"query": question})
+            generated_answer = result["result"]
             
-            print("\nAI解答 >>")
-            print(result["result"].strip())
-            
+            # 获取检索信息
             source_docs = result.get("source_documents", [])
-            if source_docs:
-                print("\n参考古籍 >>")
-                for i, doc in enumerate(source_docs):
-                    source = doc.metadata.get("source", "未知")
-                    score = doc.metadata.get("score", 0)
-                    print(f"{i+1}. 来源：{source} (相似度: {score:.4f})")
-                    
-                    # 当用户请求查看原文时显示完整内容
-                    if query.lower() == "source":
-                        print(f"   原文片段：{doc.page_content[:300]}...")
-            else:
-                print("\n⚠️ 未找到相关古籍原文，回答基于中医常识")
+            retrieval_scores = [doc.metadata.get("score", 0.0) for doc in source_docs]
+            avg_retrieval_score = sum(retrieval_scores) / len(retrieval_scores) if retrieval_scores else 0.0
             
-            print("\n" + "="*50 + "\n")
-        
-        except faiss.Error as e:
-            print(f"检索引擎错误：{str(e)}")
-        except torch.cuda.OutOfMemoryError:
-            print("显存不足！请尝试减少检索数量（修改NEAREST_NEIGHBORS参数）")
+            # 计算语义相似度
+            similarity = calculate_semantic_similarity(eval_model, generated_answer, reference)
+            
+            # 更新指标
+            metrics["answered_questions"] += 1
+            metrics["avg_similarity"] += similarity
+            metrics["avg_retrieval_score"] += avg_retrieval_score
+            metrics["avg_retrieved_docs"] += len(source_docs)
+            
+            # 保存结果详情
+            result_details = {
+                "id": item.get("id", len(results)),
+                "question": question,
+                "reference_answer": reference,
+                "generated_answer": generated_answer,
+                "semantic_similarity": float(similarity),  # 转换为float
+                "retrieved_docs_count": len(source_docs),
+                "avg_retrieval_score": float(avg_retrieval_score),  # 转换为float
+                "source_documents": [
+                    {
+                        "content": doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content,
+                        "source": doc.metadata.get("source", "未知"),
+                        "score": float(doc.metadata.get("score", 0.0))  # 转换为float
+                    }
+                    for doc in source_docs
+                ]
+            }
+            results.append(result_details)
+            
         except Exception as e:
-            print(f"系统异常：{str(e)}")
+            print(f"\n处理问题失败: '{question}' - {str(e)}")
+            metrics["failed_questions"] += 1
+            results.append({
+                "id": item.get("id", len(results)),
+                "question": question,
+                "error": str(e)
+            })
+    
+    # 计算平均指标
+    if metrics["answered_questions"] > 0:
+        metrics["avg_similarity"] /= metrics["answered_questions"]
+        metrics["avg_retrieval_score"] /= metrics["answered_questions"]
+        metrics["avg_retrieved_docs"] /= metrics["answered_questions"]
+    
+    # 保存评估结果
+    evaluation_results = {
+        "metrics": metrics,
+        "details": results
+    }
+    
+    with open(EVAL_RESULTS_PATH, "w", encoding="utf-8") as f:
+        json.dump(evaluation_results, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n评估完成! 结果已保存至: {EVAL_RESULTS_PATH}")
+    return evaluation_results
+
+# --------------------- 结果分析 ---------------------
+def analyze_results(evaluation_results: Dict):
+    """分析并打印评估结果"""
+    metrics = evaluation_results["metrics"]
+    details = evaluation_results["details"]
+    
+    print("\n" + "="*50)
+    print("中医古籍问答系统评估报告")
+    print("="*50)
+    
+    print(f"\n总体指标:")
+    print(f"  - 测试问题总数: {metrics['total_questions']}")
+    print(f"  - 成功回答问题数: {metrics['answered_questions']}")
+    print(f"  - 失败问题数: {metrics['failed_questions']}")
+    print(f"  - 平均语义相似度: {metrics['avg_similarity']:.4f}")
+    print(f"  - 平均检索分数: {metrics['avg_retrieval_score']:.4f}")
+    print(f"  - 平均检索文档数: {metrics['avg_retrieved_docs']:.2f}")
+    
+    # 找出最佳和最差表现的问题
+    answered_details = [d for d in details if "semantic_similarity" in d]
+    if answered_details:
+        best = max(answered_details, key=lambda x: x["semantic_similarity"])
+        worst = min(answered_details, key=lambda x: x["semantic_similarity"])
+        
+        print("\n最佳表现问题:")
+        print(f"  - ID: {best['id']}")
+        print(f"  - 问题: {best['question']}")
+        print(f"  - 参考答案: {best['reference_answer'][:100]}...")
+        print(f"  - 生成答案: {best['generated_answer'][:100]}...")
+        print(f"  - 语义相似度: {best['semantic_similarity']:.4f}")
+        
+        print("\n最差表现问题:")
+        print(f"  - ID: {worst['id']}")
+        print(f"  - 问题: {worst['question']}")
+        print(f"  - 参考答案: {worst['reference_answer'][:100]}...")
+        print(f"  - 生成答案: {worst['generated_answer'][:100]}...")
+        print(f"  - 语义相似度: {worst['semantic_similarity']:.4f}")
+    
+    # 分析失败原因
+    failed_details = [d for d in details if "error" in d]
+    if failed_details:
+        print("\n失败问题分析:")
+        for item in failed_details[:3]:  # 显示前3个失败问题
+            print(f"  - ID: {item['id']}")
+            print(f"   问题: {item['question']}")
+            print(f"   错误原因: {item['error']}")
+    
+    print("\n" + "="*50)
 
 # --------------------- 主程序 ---------------------
 if __name__ == "__main__":
-
     # 1. 环境检测
     if USE_GPU and not torch.cuda.is_available():
         print("警告：检测到GPU配置但无可用CUDA设备，将使用CPU模式")
         USE_GPU = False
     
-    # 2. 检查数据目录
-    if not os.path.exists(JSON_CACHE_FILE):
-        print(f"警告：未找到缓存文件 {JSON_CACHE_FILE}")
-        print("请确保已运行数据处理脚本并生成缓存文件")
+    # 2. 检查必要文件
+    for path in [JSON_CACHE_FILE, TEST_DATA_PATH]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"必要文件未找到: {path}")
     
     # 3. 加载问答系统
-    try:
-        print("正在初始化中医古籍问答系统...")
-        qa_chain = initialize_qa_chain()
-        print("系统初始化成功！")
-    except Exception as e:
-        print(f"系统初始化失败：{str(e)}")
-        print(f"请检查：")
-        print(f"1. 嵌入模型是否在 {LOCAL_EMBEDDING_MODEL_PATH}")
-        print(f"2. 大模型是否在 {LOCAL_LLM_MODEL_PATH}")
-        print(f"3. 缓存文件是否在 {JSON_CACHE_FILE}")
-        exit(1)
+    print("\n正在初始化中医古籍问答系统...")
+    qa_chain = initialize_qa_chain()
+    print("系统初始化成功!")
     
-    # 4. 启动交互界面
-    interactive_console(qa_chain)
+    # 4. 加载测试数据
+    test_data = load_test_data()
+    
+    # 5. 执行评估
+    evaluation_results = evaluate_qa_system(qa_chain, test_data)
+    
+    # 6. 分析并打印结果
+    analyze_results(evaluation_results)
