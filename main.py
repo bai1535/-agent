@@ -3,7 +3,8 @@ import faiss
 import json
 import torch
 import numpy as np
-from typing import List, Optional, Dict
+import re
+from typing import List, Optional, Dict, Tuple, Union
 from langchain.schema import Document
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -270,9 +271,414 @@ def build_vector_store() -> CustomFAISS:
     
     return vector_store
 
-# --------------------- 问答系统初始化 ---------------------
-def initialize_qa_chain() -> RetrievalQA:
-    """初始化问答链"""
+# --------------------- 问答系统核心类 ---------------------
+class MedicalQAChain:
+    def __init__(self, vector_store: CustomFAISS, llm: HuggingFacePipeline):
+        self.vector_store = vector_store
+        self.llm = llm
+        
+        # 定义专用提示词模板
+        self.templates = {
+            "medical_relevance": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要判断用户问题是否与中医医药相关。
+            
+            ### 相关领域定义：
+            1. 疾病：包括疾病的症状、病因、诊断、治疗等
+            2. 药物：包括草药、药材、药性、药效等
+            3. 药方：包括方剂、处方、针灸、推拿、按摩等治疗方法
+            4. 中医理论：包括阴阳五行、脏腑经络、气血津液等
+            
+            ### 用户问题：
+            {query}
+            
+            ### 判断要求：
+            1. 如果问题涉及以上任何领域，回答"是"
+            2. 如果问题完全不涉及以上领域，回答"否"
+            
+            ### 回答格式：
+            只需回答一个字："是"或"否"
+            """,
+            
+            "question_classification": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要对用户问题进行分类。
+            
+            ### 分类选项：
+            1. 疾病：问题涉及疾病的症状、病因、诊断、治疗等
+            2. 药物：问题涉及草药、药材、药性、药效等
+            3. 药方：问题涉及方剂、处方、针灸、推拿、按摩等治疗方法
+            4. 多领域：问题同时涉及以上多个领域
+            
+            ### 用户问题：
+            {query}
+            
+            ### 分类要求：
+            1. 根据问题内容选择最合适的分类
+            2. 如果问题涉及多个领域，选择"多领域"
+            
+            ### 回答格式：
+            只需回答一个词：["疾病", "药物", "药方", "多领域"]
+            """,
+            
+            "tcm_translation": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要将现代医学术语转换为中医术语。
+            
+            ### 转换要求：
+            1. 使用中医特有的表达方式
+            2. 保持原意的准确性
+            3. 遵循中医经典表述
+            
+            ### 示例：
+            输入：头痛、发热
+            输出：头痛、发热
+            
+            输入：高血压
+            输出：眩晕
+            
+            输入：糖尿病
+            输出：消渴
+            
+            输入：患者感觉头晕，伴有恶心
+            输出：头晕，恶心欲呕
+            
+            输入：失眠多梦
+            输出：不寐多梦
+            
+            ### 待转换内容：
+            {term}
+            
+            ### 回答格式：
+            只需输出转换后的中医术语描述
+            """,
+            
+            "disease_symptom": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户关于疾病症状的问题。
+            
+            ### 检索到的古籍原文：
+            {context}
+            
+            ### 用户问题：
+            患者有以下症状：{question}
+            
+            ### 回答要求：
+            1. 严格基于提供的古籍原文内容回答
+            2. 将症状与中医疾病对应，并提供中医术语解释
+            3. 涉及相关疾病时需说明典型症状和病理机制
+            4. 如原文无直接答案，可基于中医理论合理推断
+            
+            ### 回答格式：
+            [古籍名称]记载：相关古籍原文
+            中医诊断：中医术语解释
+            """,
+            
+            "disease_name": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户关于疾病名称的问题。
+            
+            ### 检索到的古籍原文：
+            {context}
+            
+            ### 用户问题：
+            {question}
+            
+            ### 回答要求：
+            1. 严格基于提供的古籍原文内容回答
+            2. 解释疾病的病因、病机、典型症状和治疗方法
+            3. 如原文无直接答案，可基于中医理论合理推断
+            
+            ### 回答格式：
+            [古籍名称]记载：相关古籍原文
+            中医解析：详细解释
+            """,
+            
+            "drug": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户关于药物的问题。
+            
+            ### 检索到的古籍原文：
+            {context}
+            
+            ### 用户问题：
+            {question}
+            
+            ### 回答要求：
+            1. 严格基于提供的古籍原文内容回答
+            2. 详细说明药物的性味归经、功效主治、用法用量
+            3. 如涉及药物配伍，需完整列出
+            
+            ### 回答格式：
+            [古籍名称]记载：相关古籍原文
+            药物详解：详细解释
+            """,
+            
+            "prescription": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户关于药方的问题。
+            
+            ### 检索到的古籍原文：
+            {context}
+            
+            ### 用户问题：
+            {question}
+            
+            ### 回答要求：
+            1. 严格基于提供的古籍原文内容回答
+            2. 详细说明药方的组成、功效、主治、用法
+            3. 如原文无直接答案，可基于中医理论合理推断
+            
+            ### 回答格式：
+            [古籍名称]记载：相关古籍原文
+            方剂解析：详细解释
+            """,
+            
+            "multi_topic": """
+            ### 系统角色：
+            你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户涉及多个领域的问题。
+            
+            ### 检索到的古籍原文：
+            {context}
+            
+            ### 用户问题：
+            {question}
+            
+            ### 回答要求：
+            1. 严格基于提供的古籍原文内容回答
+            2. 分别回答疾病、药物、药方相关部分
+            3. 保持回答结构清晰，逻辑严谨
+            
+            ### 回答格式：
+            [疾病部分]
+            [古籍名称]记载：相关古籍原文
+            解析：...
+            
+            [药物部分]
+            [古籍名称]记载：相关古籍原文
+            解析：...
+            
+            [药方部分]
+            [古籍名称]记载：相关古籍原文
+            解析：...
+            """
+        }
+    
+    def call_llm(self, prompt_template: str, input_vars: dict, max_tokens=100, temperature=0.1) -> str:
+        """调用LLM并返回结果"""
+        try:
+            prompt = PromptTemplate(
+                template=prompt_template.strip(),
+                input_variables=list(input_vars.keys())
+            )
+            formatted_prompt = prompt.format(**input_vars)
+            result = self.llm(formatted_prompt, max_new_tokens=max_tokens, temperature=temperature)
+            return result.strip()
+        except Exception as e:
+            print(f"LLM调用失败: {str(e)}")
+            return ""
+    
+    def is_medical_question(self, query: str) -> bool:
+        """使用LLM判断问题是否与医药相关"""
+        result = self.call_llm(
+            self.templates["medical_relevance"],
+            {"query": query},
+            max_tokens=10
+        )
+        return "是" in result
+    
+    def classify_question(self, query: str) -> str:
+        """使用LLM分类问题类型: disease, drug, prescription, multi"""
+        result = self.call_llm(
+            self.templates["question_classification"],
+            {"query": query},
+            max_tokens=10
+        )
+        
+        # 解析LLM返回的分类
+        if "疾病" in result:
+            return "disease"
+        elif "药物" in result:
+            return "drug"
+        elif "药方" in result:
+            return "prescription"
+        elif "多领域" in result:
+            return "multi"
+        else:
+            return "unknown"
+    
+    def translate_to_tcm(self, term: str) -> str:
+        """使用LLM将术语翻译为中医术语"""
+        return self.call_llm(
+            self.templates["tcm_translation"],
+            {"term": term},
+            max_tokens=100
+        )
+    
+    def is_symptom_query(self, query: str) -> bool:
+        """使用LLM判断是否是症状查询"""
+        # 简化处理，实际应用中可添加专用LLM判断
+        return "症状" in query or "表现" in query or "感觉" in query
+    
+    def retrieve_documents(self, query: str, k: int = NEAREST_NEIGHBORS) -> List[Tuple[Document, float]]:
+        """检索相关文档"""
+        return self.vector_store.similarity_search_with_score(query, k=k)
+    
+    def rerank_documents(self, docs_scores: List[Tuple[Document, float]]) -> List[Document]:
+        """重排序文档（按相似度分数）"""
+        # 按相似度分数降序排序
+        sorted_docs = sorted(docs_scores, key=lambda x: x[1], reverse=True)
+        return [doc for doc, score in sorted_docs]
+    
+    def generate_answer(self, context_docs: List[Document], query: str, template_type: str) -> str:
+        """使用指定模板生成回答"""
+        # 合并文档内容
+        context = "\n\n".join([doc.page_content for doc in context_docs])
+        
+        # 获取对应模板
+        template = self.templates.get(template_type, self.templates["disease_name"])
+        
+        # 生成回答
+        return self.call_llm(
+            template,
+            {"context": context, "question": query},
+            max_tokens=500
+        )
+    
+    def process_disease(self, query: str) -> str:
+        """处理疾病相关查询"""
+        if self.is_symptom_query(query):
+            # 流程4: 症状查询
+            # 使用LLM翻译症状
+            tcm_query = self.translate_to_tcm(query)
+            
+            # 分别用原查询和翻译后的查询检索
+            original_docs = self.retrieve_documents(query)
+            translated_docs = self.retrieve_documents(tcm_query)
+            
+            # 合并并重排序
+            combined_docs = original_docs + translated_docs
+            reranked_docs = self.rerank_documents(combined_docs)
+            
+            # 生成回答
+            return self.generate_answer(reranked_docs, query, "disease_symptom")
+        else:
+            # 流程4: 疾病名称查询
+            tcm_query = self.translate_to_tcm(query)
+            
+            # 分别用原查询和翻译后的查询检索
+            original_docs = self.retrieve_documents(query)
+            translated_docs = self.retrieve_documents(tcm_query)
+            
+            # 合并并重排序
+            combined_docs = original_docs + translated_docs
+            reranked_docs = self.rerank_documents(combined_docs)
+            
+            # 进入流程8
+            return self.process_final(reranked_docs, query, "disease_name")
+    
+    def process_drug(self, query: str) -> str:
+        """处理药物相关查询"""
+        # 流程5: 药物查询
+        tcm_query = self.translate_to_tcm(query)
+        
+        # 分别用原查询和翻译后的查询检索
+        original_docs = self.retrieve_documents(query)
+        translated_docs = self.retrieve_documents(tcm_query)
+        
+        # 合并并重排序
+        combined_docs = original_docs + translated_docs
+        reranked_docs = self.rerank_documents(combined_docs)
+        
+        # 进入流程8
+        return self.process_final(reranked_docs, query, "drug")
+    
+    def process_prescription(self, query: str) -> str:
+        """处理药方相关查询"""
+        # 流程6: 药方查询
+        docs = self.retrieve_documents(query)
+        reranked_docs = self.rerank_documents(docs)
+        
+        # 进入流程8
+        return self.process_final(reranked_docs, query, "prescription")
+    
+    def extract_components(self, query: str) -> Dict[str, str]:
+        """提取问题中的症状、药物、药方成分"""
+        # 简化处理，实际应用中可添加专用LLM提取
+        components = {"symptom": "", "drug": "", "prescription": ""}
+        
+        if "症状" in query:
+            components["symptom"] = query
+        if "药" in query and not ("药方" in query or "处方" in query):
+            components["drug"] = query
+        if "方" in query or "针灸" in query or "推拿" in query:
+            components["prescription"] = query
+        
+        return components
+    
+    def process_multi_topic(self, query: str) -> str:
+        """处理多主题查询"""
+        # 流程7: 多主题查询
+        components = self.extract_components(query)
+        
+        # 分别处理每个组件
+        all_docs = []
+        
+        if components["symptom"]:
+            # 处理症状
+            tcm_query = self.translate_to_tcm(components["symptom"])
+            symptom_docs = self.retrieve_documents(components["symptom"]) + self.retrieve_documents(tcm_query)
+            all_docs.extend(symptom_docs)
+        
+        if components["drug"]:
+            # 处理药物
+            tcm_query = self.translate_to_tcm(components["drug"])
+            drug_docs = self.retrieve_documents(components["drug"]) + self.retrieve_documents(tcm_query)
+            all_docs.extend(drug_docs)
+        
+        if components["prescription"]:
+            # 处理药方
+            prescription_docs = self.retrieve_documents(components["prescription"])
+            all_docs.extend(prescription_docs)
+        
+        # 重排序所有文档
+        reranked_docs = self.rerank_documents(all_docs)
+        
+        # 进入流程8
+        return self.process_final(reranked_docs, query, "multi_topic")
+    
+    def process_final(self, docs: List[Document], query: str, template_type: str) -> str:
+        """流程8: 最终处理（重排序并生成回答）"""
+        # 重排序文档
+        reranked_docs = self.rerank_documents([(doc, doc.metadata.get("score", 0)) for doc in docs])
+        
+        # 生成回答
+        return self.generate_answer(reranked_docs, query, template_type)
+    
+    def answer_question(self, query: str) -> str:
+        """主问答流程"""
+        # 流程1: 使用LLM判断是否与医药相关
+        if not self.is_medical_question(query):
+            return "对不起，你的问题无关医药，本系统无法回答。"
+        
+        # 流程3: 使用LLM分类问题类型
+        question_type = self.classify_question(query)
+        
+        # 根据问题类型路由到不同处理流程
+        if question_type == "disease":
+            return self.process_disease(query)
+        elif question_type == "drug":
+            return self.process_drug(query)
+        elif question_type == "prescription":
+            return self.process_prescription(query)
+        elif question_type == "multi":
+            return self.process_multi_topic(query)
+        else:
+            return "无法确定问题类型，请重新表述您的问题。"
+
+# --------------------- 系统初始化 ---------------------
+def initialize_qa_system():
+    """初始化问答系统"""
     # 1. 加载向量数据库
     vector_store = build_vector_store()
     
@@ -298,71 +704,24 @@ def initialize_qa_chain() -> RetrievalQA:
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=500,  # 增加生成长度以容纳完整回答
-        temperature=0.2,    # 降低随机性
+        max_new_tokens=500,
+        temperature=0.1,
         top_p=0.9,
         repetition_penalty=1.2,
-        pad_token_id=tokenizer.eos_token_id  # 避免警告
+        pad_token_id=tokenizer.eos_token_id
     )
     
     llm = HuggingFacePipeline(pipeline=pipe)
     
-    # 3. 构建基础检索器
-    print("构建基础检索器...")
-    retriever = vector_store.as_retriever(
-        search_type="similarity",  # 使用相似度搜索
-        search_kwargs={
-            "k": NEAREST_NEIGHBORS,
-            "score_threshold": SCORE_THRESHOLD
-        }
-    )
-    
-    # 4. 改进的中医问答专用提示模板
-    prompt_template = """
-    ### 系统角色：
-    你是一位专业的中医古籍知识专家，需要基于古籍原文回答用户问题。
-    
-    ### 检索到的古籍原文：
-    {context}
-    
-    ### 用户问题：
-    {question}
-    
-    ### 回答要求：
-    1. 严格基于提供的古籍原文内容回答
-    2. 回答需准确、简洁、专业
-    3. 涉及药方需完整列出药材和剂量
-    4. 如原文无直接答案，可基于中医理论合理推断
-    5. 如无相关古籍原文，请明确告知并给出中医常识解释
-    
-    ### 回答格式：
-    [古籍名称]载：相关古籍原文
-    
-    ### 回答内容：
-    """
-    prompt = PromptTemplate(
-        template=prompt_template.strip(),
-        input_variables=["context", "question"]
-    )
-    
-    # 5. 创建问答链
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={
-            "prompt": prompt,
-            "verbose": False  # 关闭详细日志
-        },
-        return_source_documents=True
-    )
+    # 3. 创建问答链
+    return MedicalQAChain(vector_store, llm)
 
 # --------------------- 终端交互 ---------------------
-def interactive_console(qa_chain: RetrievalQA):
+def interactive_console(qa_system: MedicalQAChain):
     """命令行交互界面"""
     print("\n===== 中医古籍智能问答系统 =====")
     print("输入格式：直接提问（支持中医病症、方剂、药材等问题）")
-    print("输入'quit'退出，输入'source'查看参考原文\n")
+    print("输入'quit'退出\n")
     
     while True:
         query = input("用户提问 >> ").strip()
@@ -370,38 +729,18 @@ def interactive_console(qa_chain: RetrievalQA):
             break
         
         try:
-            print("\n正在检索古籍数据库...")
-            result = qa_chain.invoke({"query": query})
+            print("\n正在处理问题...")
+            result = qa_system.answer_question(query)
             
             print("\nAI解答 >>")
-            print(result["result"].strip())
-            
-            source_docs = result.get("source_documents", [])
-            if source_docs:
-                print("\n参考古籍 >>")
-                for i, doc in enumerate(source_docs):
-                    source = doc.metadata.get("source", "未知")
-                    score = doc.metadata.get("score", 0)
-                    print(f"{i+1}. 来源：{source} (相似度: {score:.4f})")
-                    
-                    # 当用户请求查看原文时显示完整内容
-                    if query.lower() == "source":
-                        print(f"   原文片段：{doc.page_content[:300]}...")
-            else:
-                print("\n⚠️ 未找到相关古籍原文，回答基于中医常识")
-            
+            print(result.strip())
             print("\n" + "="*50 + "\n")
         
-        except faiss.Error as e:
-            print(f"检索引擎错误：{str(e)}")
-        except torch.cuda.OutOfMemoryError:
-            print("显存不足！请尝试减少检索数量（修改NEAREST_NEIGHBORS参数）")
         except Exception as e:
-            print(f"系统异常：{str(e)}")
+            print(f"处理问题时出错: {str(e)}")
 
 # --------------------- 主程序 ---------------------
 if __name__ == "__main__":
-
     # 1. 环境检测
     if USE_GPU and not torch.cuda.is_available():
         print("警告：检测到GPU配置但无可用CUDA设备，将使用CPU模式")
@@ -415,7 +754,7 @@ if __name__ == "__main__":
     # 3. 加载问答系统
     try:
         print("正在初始化中医古籍问答系统...")
-        qa_chain = initialize_qa_chain()
+        qa_system = initialize_qa_system()
         print("系统初始化成功！")
     except Exception as e:
         print(f"系统初始化失败：{str(e)}")
@@ -426,4 +765,4 @@ if __name__ == "__main__":
         exit(1)
     
     # 4. 启动交互界面
-    interactive_console(qa_chain)
+    interactive_console(qa_system)
